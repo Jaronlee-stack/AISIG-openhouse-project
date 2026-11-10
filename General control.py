@@ -1,3 +1,4 @@
+import os
 import socketio
 import pygame
 import time
@@ -18,7 +19,7 @@ MAX_SPEED = 1.3
 WAVESHARE_NAMESPACE = '/json'
 
 sio = socketio.Client()
-ROBOT_URL = "http://192.168.50.5:5000"
+ROBOT_URL = os.environ.get("ROBOT_URL", "http://192.168.50.5:5000")
 
 # Initialize Pygame Controller Subsystems
 pygame.init()
