@@ -52,6 +52,8 @@ def start_driving_loop():
     # Track the last sent motor speeds to prevent spamming duplicates
     last_left = None
     last_right = None
+    # Throttle console output so printing doesn't stall the control loop
+    last_print = 0.0
 
     while True:
         # Flush internal event queues to refresh system inputs
@@ -87,7 +89,7 @@ def start_driving_loop():
                 print("🛑 STOPPED (No Active Input Detected)                  ", end="\r")
                 last_left = 0.0
                 last_right = 0.0
-            time.sleep(0.05)
+            time.sleep(0.01)
             continue
         
         # 4. Differential Drive Mixing Logic
@@ -115,13 +117,16 @@ def start_driving_loop():
             # 7. Broadcast Frame to the correct namespace
             if sio.connected:
                 sio.emit('json', payload, namespace=WAVESHARE_NAMESPACE)
-                print(f"Driving -> L: {payload['L']} | R: {payload['R']}                  ", end="\r")
+                now = time.monotonic()
+                if now - last_print >= 0.5:
+                    print(f"Driving -> L: {payload['L']} | R: {payload['R']}                  ", end="\r")
+                    last_print = now
             
             # Update state anchors
             last_left = final_left
             last_right = final_right
             
-        time.sleep(0.05)  # 20Hz cap safely handling network changes
+        time.sleep(0.01)  # ~100Hz loop cap; sends only on change, so network traffic stays low
 
 if __name__ == '__main__':
     try:
