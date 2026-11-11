@@ -130,7 +130,12 @@ def start_driving_loop():
 
 if __name__ == '__main__':
     try:
-        sio.connect(ROBOT_URL, namespaces=[WAVESHARE_NAMESPACE], transports=['websocket'])
+        try:
+            sio.connect(ROBOT_URL, namespaces=[WAVESHARE_NAMESPACE], transports=['websocket'])
+        except Exception as e:
+            print(f"❌ Could not connect to robot at {ROBOT_URL}{WAVESHARE_NAMESPACE}: {e}")
+            print("   Check that the robot is powered on, this PC is on its network, and ROBOT_URL is correct.")
+            sys.exit(1)
         start_driving_loop()
     except KeyboardInterrupt:
         print("\nHalting session loop. Forcing safe vehicle brake drop sequence...")
