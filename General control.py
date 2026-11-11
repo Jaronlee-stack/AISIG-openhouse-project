@@ -4,12 +4,21 @@ import pygame
 import time
 import sys
 
-# Seconds given to each calibration step (gas, brake, steering)
-CALIBRATION_SECONDS = 4
-# An axis must move at least this far during its step to be accepted
-MIN_AXIS_RANGE = 0.3
+# --- Confirmed hardware mapping for this Thrustmaster T300 setup ---
+# Found using probe_axes.py: axis 0 = steering wheel, axis 1 = brake pedal,
+# axis 2 = gas pedal. Axis 3 did not respond to gas/brake/steering in testing
+# (likely a clutch pedal or unused axis) and is not used here.
+AXIS_STEERING = 0
+AXIS_BRAKE    = 1
+AXIS_THROTTLE = 2
 
-# Deadzone threshold: ignore minor stick drift or pedal rest noise
+# Measured rest / fully-pressed values for each pedal (see probe_axes.py).
+# These are NOT both -1.0/+1.0 - the brake only travels part of the axis range,
+# and the old script's fixed -1..+1 assumption is why it misread the pedals.
+GAS_REST,   GAS_PRESSED   = 1.00, -0.86
+BRAKE_REST, BRAKE_PRESSED = 1.00,  0.39
+
+# Deadzone threshold: ignore minor stick drift or uncalibrated pedal rest noise
 DEADZONE = 0.05
 
 # Calibrated precisely to your system specs
@@ -42,79 +51,28 @@ def disconnect():
     print("⚠️ Connection dropped from UGV Beast.")
 
 
-def read_axes():
+def normalize_pedal(axis_value, rest, pressed):
+    """Maps a pedal's own rest->pressed range to [0.0, 1.0], whatever that range is."""
+    span = pressed - rest
+    if abs(span) < 1e-6:
+        return 0.0
+    normalized = (axis_value - rest) / span
+    return max(0.0, min(1.0, normalized))
+
+
+def capture_steering_center():
+    """This wheel has no auto-centering spring, so it can rest anywhere.
+    Read its value once at startup (don't touch the wheel) and treat that as
+    'centered' for the rest of the run."""
     pygame.event.pump()
-    return [wheel.get_axis(i) for i in range(wheel.get_numaxes())]
+    time.sleep(0.1)
+    pygame.event.pump()
+    center = wheel.get_axis(AXIS_STEERING)
+    print(f"🎯 Steering centered at current wheel position ({center:+.2f}). Don't touch the wheel yet... centering locked in.")
+    return center
 
 
-def calibrate():
-    """Ask the user to move each control, and pick the axis that moves for each one.
-
-    Works on any wheel, so the axis numbers don't have to be hard-coded.
-    """
-    print("\n=== Calibration ===")
-    print("Leave the wheel and pedals untouched, then press Enter.")
-    input()
-    rest = read_axes()
-
-    steps = [
-        ("gas", "Press the GAS pedal fully and hold it"),
-        ("brake", "Press the BRAKE pedal fully and hold it"),
-        ("steering", "Turn the STEERING wheel fully left, then fully right"),
-    ]
-    results = {}
-    for name, prompt in steps:
-        input(f"{prompt}. Press Enter, then do it for {CALIBRATION_SECONDS} seconds...")
-        lo = [1e9] * len(rest)
-        hi = [-1e9] * len(rest)
-        end = time.time() + CALIBRATION_SECONDS
-        while time.time() < end:
-            values = read_axes()
-            for i, v in enumerate(values):
-                lo[i] = min(lo[i], v)
-                hi[i] = max(hi[i], v)
-            time.sleep(0.01)
-
-        used = [r["axis"] for r in results.values()]
-        candidates = [i for i in range(len(rest)) if i not in used]
-        best = max(candidates, key=lambda i: hi[i] - lo[i])
-        if hi[best] - lo[best] < MIN_AXIS_RANGE:
-            print(f"❌ Calibration failed: no axis moved enough for {name}.")
-            print("   Check the wheel and pedal cables, then run the script again.")
-            sys.exit(1)
-
-        r = rest[best]
-        if name == "steering":
-            results[name] = {"axis": best, "rest": r, "lo": lo[best], "hi": hi[best]}
-        else:
-            # The pedal's pressed position is whichever extreme is farther from rest
-            pressed = lo[best] if (r - lo[best]) > (hi[best] - r) else hi[best]
-            results[name] = {"axis": best, "rest": r, "pressed": pressed}
-        print(f"   {name} -> axis {best}")
-
-    return results
-
-
-def pedal_amount(raw, c):
-    """0.0 at rest, 1.0 fully pressed."""
-    span = c["pressed"] - c["rest"]
-    if abs(span) < 1e-6:
-        return 0.0
-    return max(0.0, min(1.0, (raw - c["rest"]) / span))
-
-
-def steering_amount(raw, c):
-    """-1.0 full left, 0.0 centred, +1.0 full right (sign depends on the wheel)."""
-    if raw >= c["rest"]:
-        span = c["hi"] - c["rest"]
-    else:
-        span = c["rest"] - c["lo"]
-    if abs(span) < 1e-6:
-        return 0.0
-    return max(-1.0, min(1.0, (raw - c["rest"]) / span))
-
-
-def start_driving_loop(cal):
+def start_driving_loop(steering_center):
     print(f"\n🏎️ System Live! Max Speed Limit: {MAX_SPEED}")
     print("Let go of controls or step off pedals to auto-stop. Press Ctrl+C to halt.")
 
@@ -128,12 +86,16 @@ def start_driving_loop(cal):
         # Flush internal event queues to refresh system inputs
         pygame.event.pump()
 
-        # 1. Read calibrated inputs
-        raw_steering = steering_amount(wheel.get_axis(cal["steering"]["axis"]), cal["steering"])
-        throttle_intensity = pedal_amount(wheel.get_axis(cal["gas"]["axis"]), cal["gas"])
-        brake_intensity = pedal_amount(wheel.get_axis(cal["brake"]["axis"]), cal["brake"])
+        # 1. Read Raw Values from T300 Wheel Base
+        raw_steering = wheel.get_axis(AXIS_STEERING) - steering_center
+        raw_brake    = wheel.get_axis(AXIS_BRAKE)
+        raw_throttle = wheel.get_axis(AXIS_THROTTLE)
 
-        # 2. Apply deadzone to separate pedal intensities before mixing
+        # 2. Extract linear driving forces [0.0 to 1.0] using each pedal's own measured range
+        throttle_intensity = normalize_pedal(raw_throttle, GAS_REST, GAS_PRESSED)
+        brake_intensity    = normalize_pedal(raw_brake, BRAKE_REST, BRAKE_PRESSED)
+
+        # Apply deadzone directly to separate pedal intensities before mixing
         if throttle_intensity < DEADZONE:
             throttle_intensity = 0.0
         if brake_intensity < DEADZONE:
@@ -143,12 +105,15 @@ def start_driving_loop(cal):
 
         if abs(raw_steering) < DEADZONE:
             raw_steering = 0.0
+        raw_steering = max(-1.0, min(1.0, raw_steering))
 
         # 3. Check for absolute idle state (Auto-Stop Routine)
+        # Evaluates clean, post-deadzone values to prevent endless reversing loops
         if raw_steering == 0.0 and throttle_intensity == 0.0 and brake_intensity == 0.0:
             if last_left != 0.0 or last_right != 0.0:
+                stop_payload = {"T": 1, "L": 0.0, "R": 0.0}
                 if sio.connected:
-                    sio.emit('json', {"T": 1, "L": 0.0, "R": 0.0}, namespace=WAVESHARE_NAMESPACE)
+                    sio.emit('json', stop_payload, namespace=WAVESHARE_NAMESPACE)
                 print("🛑 STOPPED (No Active Input Detected)                  ", end="\r")
                 last_left = 0.0
                 last_right = 0.0
@@ -156,24 +121,28 @@ def start_driving_loop(cal):
             continue
 
         # 4. Differential Drive Mixing Logic
-        left_speed = linear_drive + raw_steering
+        left_speed  = linear_drive + raw_steering
         right_speed = linear_drive - raw_steering
 
         # 5. Proportional Normalization
         max_motor_calc = max(abs(left_speed), abs(right_speed))
         if max_motor_calc > 1.0:
-            left_speed /= max_motor_calc
+            left_speed  /= max_motor_calc
             right_speed /= max_motor_calc
 
-        # Scale outputs up to the speed limit
-        final_left = round(left_speed * MAX_SPEED, 2)
+        # Scale outputs strictly up to your 1.3 limit
+        final_left  = round(left_speed * MAX_SPEED, 2)
         final_right = round(right_speed * MAX_SPEED, 2)
 
         # 6. Only send over network if values have ACTUALLY changed
         if final_left != last_left or final_right != last_right:
-            payload = {"T": 1, "L": final_left, "R": final_right}
+            payload = {
+                "T": 1,
+                "L": final_left,
+                "R": final_right
+            }
 
-            # 7. Broadcast frame to the correct namespace
+            # 7. Broadcast Frame to the correct namespace
             if sio.connected:
                 sio.emit('json', payload, namespace=WAVESHARE_NAMESPACE)
                 now = time.monotonic()
@@ -185,15 +154,10 @@ def start_driving_loop(cal):
             last_left = final_left
             last_right = final_right
 
-        time.sleep(0.01)  # ~100Hz loop cap; sends only on change
-
+        time.sleep(0.01)  # ~100Hz loop cap; sends only on change, so network traffic stays low
 
 if __name__ == '__main__':
-    # Calibrate before connecting, so the robot can't move during setup
-    cal = calibrate()
-    print(f"Calibrated: steering axis {cal['steering']['axis']}, "
-          f"gas axis {cal['gas']['axis']}, brake axis {cal['brake']['axis']}")
-
+    steering_center = capture_steering_center()
     try:
         try:
             sio.connect(ROBOT_URL, namespaces=[WAVESHARE_NAMESPACE], transports=['websocket'])
@@ -201,7 +165,7 @@ if __name__ == '__main__':
             print(f"❌ Could not connect to robot at {ROBOT_URL}{WAVESHARE_NAMESPACE}: {e}")
             print("   Check that the robot is powered on, this PC is on its network, and ROBOT_URL is correct.")
             sys.exit(1)
-        start_driving_loop(cal)
+        start_driving_loop(steering_center)
     except KeyboardInterrupt:
         print("\nHalting session loop. Forcing safe vehicle brake drop sequence...")
     except Exception as e:
